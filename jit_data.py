@@ -1,9 +1,9 @@
 import h5py
 import numpy as np
 import scipy.ndimage
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 
-
+    
 ###############################
 # 1) DATA LOADING & RESIZING
 ###############################
@@ -83,7 +83,7 @@ def normalize_data_list(data_list, frame_mean, frame_std, u_mean, u_std):
 ###############################
 # 2) CREATING SEQUENCES FOR JiT
 ###############################
-def create_jit_sequences(data_list, past_window=2, delta_t=1.0):
+def create_jit_sequences(data_list, past_window=2):
     """Créer des séquences pour l'entraînement avec JiT"""
     X_frames_list, X_u_past_list, X_u_curr_list, Y_list = [], [], [], []
     for data_case in data_list:
@@ -91,22 +91,14 @@ def create_jit_sequences(data_list, past_window=2, delta_t=1.0):
         u = data_case['u']            # (T,)
         T = frames.shape[0]
         for i in range(past_window, T):
-            past_f = frames[i-past_window:i]               # (past_window, 1, H, W)
-            past_u = u[i-past_window:i].reshape(-1, 1)     # (past_window, 1)
-            current_u = np.array([u[i]], dtype=np.float32) # (1,)
-            
-            # target_f = frames[i]                           # (1, H, W)
-            
-            current_frame = frames[i-1]   # x(t)
-            next_frame = frames[i]        # x(t+1)
-            x_dot = (next_frame - current_frame) / delta_t
-
-            
+            past_f = frames[i-past_window:i]          # (past_window, 1, H, W)
+            past_u = u[i-past_window:i].reshape(-1, 1)
+            current_u = np.array([u[i]], dtype=np.float32)
+            target_f = frames[i]                       # (1, H, W)
             X_frames_list.append(past_f)
             X_u_past_list.append(past_u)
             X_u_curr_list.append(current_u)
-            Y_list.append(x_dot)
-            
+            Y_list.append(target_f)
     X_frames = np.array(X_frames_list, dtype=np.float32)
     X_u_past = np.array(X_u_past_list, dtype=np.float32)
     X_u_curr = np.array(X_u_curr_list, dtype=np.float32)

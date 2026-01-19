@@ -202,7 +202,7 @@ class JiTBlock(nn.Module):
 # 4) JiT-BASED CONDITIONAL DIFFUSION MODEL
 ###############################
 class JiTFluidDiffusion(nn.Module):
-    def __init__( 
+    def __init__(
         self,
         img_size,
         patch_size=16,
@@ -217,7 +217,9 @@ class JiTFluidDiffusion(nn.Module):
         P_mean=-0.8,
         P_std=0.8,
         t_eps=0.05,
-        noise_scale=1.0
+        noise_scale=1.0,
+        prediction_type="x-pred",
+        loss_type="v-loss"
     ):
         super().__init__()
         self.img_size = img_size
@@ -231,6 +233,8 @@ class JiTFluidDiffusion(nn.Module):
         self.P_std = P_std
         self.t_eps = t_eps
         self.noise_scale = noise_scale
+        self.prediction_type = prediction_type
+        self.loss_type = loss_type
         
         # Embedders
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -275,7 +279,6 @@ class JiTFluidDiffusion(nn.Module):
             self.pos_embed.shape[-1], 
             int(self.x_embedder.num_patches ** 0.5)
         )
-        # (B, num_patches, hidden_size)
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
         
         # Initialize patch embeddings
@@ -332,15 +335,15 @@ class JiTFluidDiffusion(nn.Module):
         # Add noise to target frame (forward diffusion)
         e = torch.randn_like(target_frame) * self.noise_scale
         z_t = t * target_frame + (1 - t) * e
-        
         # Ground truth velocity
-        v = (target_frame - z_t) / (1 - t).clamp_min(self.t_eps)
+        # v = (target_frame - z_t) / (1 - t).clamp_min(self.t_eps)
+        v = target_frame - e
+        
         
         # Embed conditioning
-        # (B, past_window, 1, H, W) -> (B, past_window, H, W)
-        cond_frames_reshaped = cond_frames.squeeze(2)
-        # (B, past_window, H, W) -> (B, num_patches, hidden_size)
-        cond_tokens = self.cond_embedder(cond_frames_reshaped)
+        # Reshape cond_frames: (B, past_window, 1, H, W) -> (B, past_window, H, W)
+        cond_frames_reshaped = cond_frames.squeeze(2)  # (B, past_window, H, W)
+        cond_tokens = self.cond_embedder(cond_frames_reshaped)  # (B, num_patches, hidden_size)
         
         # Embed noisy target
         x_tokens = self.x_embedder(z_t)  # (B, num_patches, hidden_size)
@@ -358,19 +361,61 @@ class JiTFluidDiffusion(nn.Module):
         for block in self.blocks:
             tokens = block(tokens, c)
         
+        
         # Final layer predicts x directly
-        x_dot_pred_tokens = self.final_layer(tokens, c)
-        x_dot_pred = self.unpatchify(x_dot_pred_tokens)
-        
-        # Convert x_pred to v_pred for loss
-        v_dot_pred = (x_dot_pred - z_t) / (1 - t).clamp_min(self.t_eps)
-        
-        # v-loss
-        loss = F.smooth_l1_loss(v_dot_pred, v)
+        if self.prediction_type == "x-pred":
+            x_pred_tokens = self.final_layer(tokens, c)
+            x_pred = self.unpatchify(x_pred_tokens)
+            
+            if self.loss_type == "x-loss":
+                loss = F.smooth_l1_loss(x_pred, target_frame)
+                
+            elif self.loss_type == "v-loss":
+                v_pred = (x_pred - z_t) / (1 - t).clamp_min(self.t_eps)
+                loss = F.smooth_l1_loss(v_pred, v)
+            elif self.loss_type == "e-loss":
+                e_pred = (z_t - t*x_pred) / (1 - t).clamp_min(self.t_eps)
+                loss = F.smooth_l1_loss(e_pred, e)
+            else:
+                raise ValueError(f"Unknown loss type: {self.loss_type}")
+            
+        elif self.prediction_type == "v-pred":
+            v_pred_tokens = self.final_layer(tokens, c)
+            v_pred = self.unpatchify(v_pred_tokens)
+            
+            if self.loss_type == "x-loss":
+                x_pred = (1 - t) * v_pred + z_t
+                loss = F.smooth_l1_loss(x_pred, target_frame)
+            elif self.loss_type == "v-loss":
+                loss = F.smooth_l1_loss(v_pred, v)
+            elif self.loss_type == "e-loss":
+                e_pred = z_t - t * v_pred
+                loss = F.smooth_l1_loss(e_pred, e)
+            else:
+                raise ValueError(f"Unknown loss type: {self.loss_type}")
+            
+            
+        elif self.prediction_type == "e-pred":
+            e_pred_tokens = self.final_layer(tokens, c)
+            e_pred = self.unpatchify(e_pred_tokens)
+            
+            if self.loss_type == "x-loss":
+                x_pred = (z_t - (1 - t) * e_pred) / t.clamp_min(self.t_eps)
+                loss = F.smooth_l1_loss(x_pred, target_frame)
+            elif self.loss_type == "v-loss":
+                v_pred = (z_t - e_pred) / t.clamp_min(self.t_eps)
+                loss = F.smooth_l1_loss(v_pred, v)
+            elif self.loss_type == "e-loss":
+                loss = F.smooth_l1_loss(e_pred, e)
+            else:
+                raise ValueError(f"Unknown loss type: {self.loss_type}")
+        else:
+            raise ValueError(f"Unknown prediction type: {self.prediction_type}")
+                
         
         return loss
-    
-    @torch.no_grad() 
+        
+    @torch.no_grad()
     def sample(self, cond_frames, cond_u_past, cond_u_curr, num_steps=50, method='heun'):
         """
         Generate a frame using reverse diffusion
@@ -406,31 +451,43 @@ class JiTFluidDiffusion(nn.Module):
         
         return z
     
+    
     def _forward_sample(self, z, t, cond_tokens, control_emb):
-        """Single forward pass during sampling"""
+        """Single forward pass during sampling - conversion to velocity"""
         B = z.size(0)
         t_scalar = t.expand(B)
         
-        # Embed noisy sample
+        # 1. Obtenir les tokens du Transformer
         x_tokens = self.x_embedder(z)
         tokens = x_tokens + cond_tokens
         
-        # Time embedding
         t_emb = self.t_embedder(t_scalar)
         c = t_emb + control_emb
         
-        # Transformer
         for block in self.blocks:
             tokens = block(tokens, c)
         
-        # Predict x
-        x_pred_tokens = self.final_layer(tokens, c)
-        x_pred = self.unpatchify(x_pred_tokens)
+        # 2. Prédire et convertir selon le type
+        raw_output_tokens = self.final_layer(tokens, c)
+        output = self.unpatchify(raw_output_tokens)
         
-        # Convert to velocity
         t_broadcast = t.view(-1, *([1] * (z.ndim - 1)))
-        v_pred = (x_pred - z) / (1.0 - t_broadcast).clamp_min(self.t_eps)
-        
+
+        if self.prediction_type == "x-pred":
+            # output is x_pred -> v = (x - z) / (1 - t)
+            v_pred = (output - z) / (1.0 - t_broadcast).clamp_min(self.t_eps)
+            
+        elif self.prediction_type == "v-pred":
+            # output is v_pred
+            v_pred = output
+            
+        elif self.prediction_type == "e-pred":
+            # output is e_pred -> v = (z - e) / t
+            v_pred = (z - output) / t_broadcast.clamp_min(self.t_eps)
+            
+        else:
+            raise ValueError(f"Unknown prediction type: {self.prediction_type}")
+            
         return v_pred
     
     def _euler_step(self, z, t_curr, t_next, cond_tokens, control_emb):

@@ -6,12 +6,13 @@ import seaborn as sns
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-
+import torch.nn.functional as F
+import os
 
 ###############################
 # 5) TRAINING LOOP
 ###############################
-def train_jit_diffusion(model, train_loader, val_loader, num_epochs, device, learning_rate=1e-4, best_model_path='models/best_jit_fluid_model.pth'):
+def train_jit_diffusion(model, train_loader, val_loader, num_epochs, device, output_path, learning_rate=1e-4):
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, betas=(0.9, 0.95), weight_decay=0.0)
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
     best_val_loss = float('inf')
@@ -59,7 +60,9 @@ def train_jit_diffusion(model, train_loader, val_loader, num_epochs, device, lea
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), best_model_path)
+            # Remplacez votre ligne par celle-ci :
+            os.makedirs(output_path, exist_ok=True) 
+            torch.save(model.state_dict(), f'{output_path}/best_jit_fluid_model.pth')
             print(f"✓ New best model saved! Val Loss: {best_val_loss:.6f}")
     
     print("\n✅ Training complete!")
@@ -68,98 +71,66 @@ def train_jit_diffusion(model, train_loader, val_loader, num_epochs, device, lea
 # 6) AUTOREGRESSIVE EVALUATION
 ###############################
 @torch.no_grad()
-def evaluate_autoregressive(
-    model,
-    data_case,
-    past_window,
-    device,
-    num_frames,
-    frame_mean,
-    frame_std,
-    num_steps=50,
-    delta_t=1.0
-):
+def evaluate_autoregressive(model, data_case, past_window, device, num_frames, frame_mean, frame_std, num_steps=50):
+    """Autoregressive rollout"""
     model.eval()
-
     frames = data_case['frames']  # (T, 1, H, W)
     u = data_case['u']
     T = frames.shape[0]
-
-    # initial history: x(t-past_window) ... x(t)
-    history_frames = frames[:past_window].copy()
-
+    
+    # Initialize history
+    history_frames = frames[:past_window].copy()  # (past_window, 1, H, W)
+    
     pred_frames = []
     mse_list = []
-
+    
     for i in range(num_frames):
         t_idx = past_window + i
         if t_idx >= T:
             break
-
-        # conditioning
-        cond_frames = history_frames[-past_window:]
+        
+        # Prepare conditioning
+        cond_frames = history_frames[-past_window:]  # (past_window, 1, H, W)
         cond_u_past = u[t_idx - past_window:t_idx].reshape(-1, 1)
         cond_u_curr = np.array([u[t_idx]], dtype=np.float32)
-
-        # to torch
-        cond_frames_tensor = torch.tensor(
-            cond_frames, dtype=torch.float32, device=device
-        ).unsqueeze(0)
-        past_u_tensor = torch.tensor(
-            cond_u_past, dtype=torch.float32, device=device
-        ).unsqueeze(0)
-        curr_u_tensor = torch.tensor(
-            cond_u_curr, dtype=torch.float32, device=device
-        ).unsqueeze(0)
-
-        # ---- DIFFUSION: sample x_dot ----
-        x_dot = model.sample(
-            cond_frames_tensor,
-            past_u_tensor,
-            curr_u_tensor,
-            num_steps=num_steps,
-            method="heun",
-        )
-
-        # torch -> numpy
-        x_dot_np = x_dot.squeeze(0).cpu().numpy()  # (1, H, W)
-
-        # ---- SOLVER (Euler) ----
-        x_curr = history_frames[-1]                # (1, H, W)
-        x_next = x_curr + delta_t * x_dot_np       # (1, H, W)
-
-
-        # store
-        pred_frames.append(x_next)
-
+        
+        # To tensors
+        cond_frames_tensor = torch.tensor(cond_frames, dtype=torch.float32, device=device).unsqueeze(0)
+        past_u_tensor = torch.tensor(cond_u_past, dtype=torch.float32, device=device).unsqueeze(0)
+        current_u_tensor = torch.tensor(cond_u_curr, dtype=torch.float32, device=device).unsqueeze(0)
+        
+        # Generate
+        pred_frame = model.sample(cond_frames_tensor, past_u_tensor, current_u_tensor, num_steps=num_steps, method='heun')
+        pred_frame_np = pred_frame.squeeze(0).cpu().numpy()
+        
         # MSE
         true_frame = frames[t_idx]
-        mse = np.mean((x_next - true_frame) ** 2)
+        mse = F.mse_loss(
+            pred_frame.squeeze(0),
+            torch.tensor(true_frame, dtype=torch.float32, device=device)
+        ).item()
         mse_list.append(mse)
-
-        # update history
-        history_frames = np.concatenate(
-            [history_frames, x_next[np.newaxis]],
-            axis=0
-        )
-        history_frames = history_frames[-past_window:]
-
+        pred_frames.append(pred_frame_np)
+        
+        # Update history
+        history_frames = np.concatenate([history_frames, pred_frame_np[np.newaxis, ...]], axis=0)
+    
     pred_frames = np.array(pred_frames)
-    true_frames = frames[past_window:past_window + len(pred_frames)]
-
-    # denormalize
-    pred_frames_denorm = pred_frames * frame_std + frame_mean
+    true_frames = frames[past_window:past_window+num_frames]
+    
+    # Denormalize
     true_frames_denorm = true_frames * frame_std + frame_mean
-
-    avg_mse = float(np.mean(mse_list))
+    pred_frames_denorm = pred_frames * frame_std + frame_mean
+    
+    avg_mse = sum(mse_list) / len(mse_list)
     print(f"Average MSE for amplitude {data_case['amplitude']}: {avg_mse:.6f}")
-
+    
     return pred_frames_denorm, true_frames_denorm, avg_mse
 
 ###############################
 # 7) VISUALIZATION
 ###############################
-def create_comparison_video(gt_frames, pred_frames, amplitude, save_path):
+def create_comparison_video(gt_frames, pred_frames, amplitude, save_path="comparison_video.gif"):
     T = gt_frames.shape[0]
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
     fig.suptitle(f"Amplitude: {amplitude}")
